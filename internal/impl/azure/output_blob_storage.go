@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
@@ -34,6 +35,8 @@ const (
 	bsoFieldPath              = "path"
 	bsoFieldBlobType          = "blob_type"
 	bsoFieldPublicAccessLevel = "public_access_level"
+	bsoFieldBatching          = "batching"
+	bsoFieldTimeout           = "timeout"
 )
 
 type bsoConfig struct {
@@ -42,6 +45,7 @@ type bsoConfig struct {
 	Path              *service.InterpolatedString
 	BlobType          *service.InterpolatedString
 	PublicAccessLevel *service.InterpolatedString
+	Timeout           time.Duration
 }
 
 func bsoConfigFromParsed(pConf *service.ParsedConfig) (conf bsoConfig, err error) {
@@ -63,6 +67,9 @@ func bsoConfigFromParsed(pConf *service.ParsedConfig) (conf bsoConfig, err error
 		return
 	}
 	if conf.PublicAccessLevel, err = pConf.FieldInterpolatedString(bsoFieldPublicAccessLevel); err != nil {
+		return
+	}
+	if conf.Timeout, err = pConf.FieldDuration(bsoFieldTimeout); err != nil {
 		return
 	}
 	return
@@ -108,17 +115,25 @@ If the `+"`storage_connection_string`"+` does not contain the `+"`AccountName`"+
 				Advanced().
 				Default("PRIVATE"),
 			service.NewOutputMaxInFlightField(),
+			service.NewDurationField(bsoFieldTimeout).
+				Description("The maximum period to wait on an upload before abandoning it and reattempting.").
+				Advanced().
+				Default("5s"),
+			service.NewBatchPolicyField(bsoFieldBatching),
 		)
 }
 
 func init() {
-	service.MustRegisterOutput("azure_blob_storage", bsoSpec(),
-		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.Output, mif int, err error) {
+	service.MustRegisterBatchOutput("azure_blob_storage", bsoSpec(),
+		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.BatchOutput, batchPolicy service.BatchPolicy, maxInFlight int, err error) {
 			var pConf bsoConfig
-			if pConf, err = bsoConfigFromParsed(conf); err != nil {
+			if maxInFlight, err = conf.FieldMaxInFlight(); err != nil {
 				return
 			}
-			if mif, err = conf.FieldMaxInFlight(); err != nil {
+			if batchPolicy, err = conf.FieldBatchPolicy(bsoFieldBatching); err != nil {
+				return
+			}
+			if pConf, err = bsoConfigFromParsed(conf); err != nil {
 				return
 			}
 			if out, err = newAzureBlobStorageWriter(pConf, mgr.Logger()); err != nil {
@@ -157,8 +172,6 @@ func (a *azureBlobStorageWriter) uploadBlob(ctx context.Context, containerName, 
 				if err != nil && !isErrorCode(err, bloberror.BlobAlreadyExists) {
 					return fmt.Errorf("creating append blob: %w", err)
 				}
-
-				// Try to upload the message again now that we created the blob
 				_, err = appendBlobClient.AppendBlock(ctx, streaming.NopCloser(bytes.NewReader(message)), nil)
 				if err != nil {
 					return fmt.Errorf("failed retrying to append block to blob: %w", err)
@@ -190,49 +203,53 @@ func (a *azureBlobStorageWriter) createContainer(ctx context.Context, containerN
 	return err
 }
 
-func (a *azureBlobStorageWriter) Write(ctx context.Context, msg *service.Message) error {
-	containerName, err := a.conf.Container.TryString(msg)
-	if err != nil {
-		return fmt.Errorf("container interpolation error: %s", err)
-	}
-
-	blobName, err := a.conf.Path.TryString(msg)
-	if err != nil {
-		return fmt.Errorf("path interpolation error: %s", err)
-	}
-
-	blobType, err := a.conf.BlobType.TryString(msg)
-	if err != nil {
-		return fmt.Errorf("blob type interpolation error: %s", err)
-	}
-
-	mBytes, err := msg.AsBytes()
-	if err != nil {
-		return err
-	}
-
-	if err := a.uploadBlob(ctx, containerName, blobName, blobType, mBytes); err != nil {
-		if isErrorCode(err, bloberror.ContainerNotFound) {
-			var accessLevel string
-			if accessLevel, err = a.conf.PublicAccessLevel.TryString(msg); err != nil {
-				return fmt.Errorf("access level interpolation error: %s", err)
-			}
-
-			if err := a.createContainer(ctx, containerName, accessLevel); err != nil {
-				if !isErrorCode(err, bloberror.ContainerAlreadyExists) {
-					return fmt.Errorf("creating container: %s", err)
-				}
-			}
-
-			if err := a.uploadBlob(ctx, containerName, blobName, blobType, mBytes); err != nil {
-				return fmt.Errorf("error retrying to upload blob: %s", err)
-			}
-		} else {
-			return fmt.Errorf("uploading blob: %s", err)
+func (a *azureBlobStorageWriter) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
+	ctx, cancel := context.WithTimeout(ctx, a.conf.Timeout)
+	defer cancel()
+ 
+	return batch.WalkWithBatchedErrors(func(i int, m *service.Message) error {
+		containerName, err := batch.TryInterpolatedString(i, a.conf.Container)
+		if err != nil {
+			return fmt.Errorf("container interpolation error: %w", err)
 		}
-	}
-	return nil
+ 
+		blobName, err := batch.TryInterpolatedString(i, a.conf.Path)
+		if err != nil {
+			return fmt.Errorf("path interpolation error: %w", err)
+		}
+ 
+		blobType, err := batch.TryInterpolatedString(i, a.conf.BlobType)
+		if err != nil {
+			return fmt.Errorf("blob type interpolation error: %w", err)
+		}
+ 
+		mBytes, err := m.AsBytes()
+		if err != nil {
+			return err
+		}
+ 
+		if err := a.uploadBlob(ctx, containerName, blobName, blobType, mBytes); err != nil {
+			if isErrorCode(err, bloberror.ContainerNotFound) {
+				accessLevel, err := batch.TryInterpolatedString(i, a.conf.PublicAccessLevel)
+				if err != nil {
+					return fmt.Errorf("access level interpolation error: %w", err)
+				}
+				if err := a.createContainer(ctx, containerName, accessLevel); err != nil {
+					if !isErrorCode(err, bloberror.ContainerAlreadyExists) {
+						return fmt.Errorf("creating container: %w", err)
+					}
+				}
+				if err := a.uploadBlob(ctx, containerName, blobName, blobType, mBytes); err != nil {
+					return fmt.Errorf("error retrying to upload blob: %w", err)
+				}
+			} else {
+				return fmt.Errorf("uploading blob: %w", err)
+			}
+		}
+		return nil
+	})
 }
+
 
 func (*azureBlobStorageWriter) Close(context.Context) error {
 	return nil
